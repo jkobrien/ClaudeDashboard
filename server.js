@@ -8,6 +8,11 @@ const path = require('path');
 
 const PORT = parseInt(process.env.PORT || '4242', 10);
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+// Token cap for the current-window gauge. A number (e.g. TOKEN_LIMIT=44000000)
+// gives a true "% of quota"; the default "max" measures against your own
+// historical busiest 5-hour block. The real cap is only visible via Claude
+// Code's /usage command — it is not present in the usage logs.
+const TOKEN_LIMIT = process.env.TOKEN_LIMIT || 'max';
 const CCUSAGE = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
 
 // Per-stage pipeline run metrics, written by the executing-pipeline tooling.
@@ -59,6 +64,7 @@ const cache = {
   daily:    { data: null, ts: 0 },
   monthly:  { data: null, ts: 0 },
   sessions: { data: null, ts: 0 },
+  blocks:   { data: null, ts: 0 },
 };
 
 function runCcusage(subcommand) {
@@ -90,6 +96,11 @@ function refreshIfStale() {
     console.log(`[${new Date().toISOString()}] refreshing sessions…`);
     cache.sessions.data = runCcusage('session');
     cache.sessions.ts = now;
+  }
+  if (now - cache.blocks.ts > CACHE_TTL) {
+    console.log(`[${new Date().toISOString()}] refreshing blocks…`);
+    cache.blocks.data = runCcusage(`blocks --active --token-limit ${TOKEN_LIMIT}`);
+    cache.blocks.ts = now;
   }
 }
 
@@ -130,6 +141,30 @@ function compute() {
   const daily    = (cache.daily.data    || {}).daily    || [];
   const monthly  = (cache.monthly.data  || {}).monthly  || [];
   const sessions = (cache.sessions.data || {}).sessions || [];
+
+  // --- Current 5-hour window (active session block) ---
+  const activeBlock = ((cache.blocks.data || {}).blocks || []).find(b => b && b.isActive) || null;
+  let window = null;
+  if (activeBlock) {
+    const tls  = activeBlock.tokenLimitStatus || {};
+    const proj = activeBlock.projection || {};
+    const burn = activeBlock.burnRate || {};
+    const limit = tls.limit || 0;
+    window = {
+      startTime: activeBlock.startTime,
+      endTime: activeBlock.endTime,
+      usedTokens: activeBlock.totalTokens || 0,
+      usedCost: activeBlock.costUSD || 0,
+      remainingMinutes: proj.remainingMinutes || 0,
+      projectedTokens: proj.totalTokens || 0,
+      projectedCost: proj.totalCost || 0,
+      limit,
+      currentPct: limit > 0 ? ((activeBlock.totalTokens || 0) / limit) * 100 : 0,
+      projectedPct: limit > 0 ? ((proj.totalTokens || 0) / limit) * 100 : 0,
+      costPerHour: burn.costPerHour || 0,
+      limitIsPeak: TOKEN_LIMIT === 'max',
+    };
+  }
 
   const now         = new Date();
   const today       = now.toISOString().split('T')[0];
@@ -238,6 +273,7 @@ function compute() {
     chartLabels, chartDatasets,
     donutData, chartGroups,
     routingOpps, topSessions,
+    window,
     pipelineExecutions: readPipelineExecutions(),
     sessionCount: sessions.length,
     refreshedAt: new Date(Math.max(cache.daily.ts, cache.monthly.ts, cache.sessions.ts)).toISOString(),
@@ -328,6 +364,19 @@ function generateInsights(d) {
 
 const $ = n => `$${Number(n || 0).toFixed(2)}`;
 const pct = n => `${Number(n || 0).toFixed(1)}%`;
+const fmtTokens = n => {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+};
+const fmtDuration = mins => {
+  mins = Math.max(0, Math.round(Number(mins || 0)));
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+};
 const shortId = id => (id || '').slice(0, 8);
 const shortPath = p => {
   if (!p) return '—';
@@ -394,6 +443,36 @@ function renderHTML(d) {
 
   const num = n => (n === undefined || n === null) ? '—' : n;
   const fmtTs = ts => ts ? String(ts).replace('T', ' ').slice(0, 19) : '—';
+
+  const w = d.window;
+  const barColor = p => p >= 80 ? '#ef4444' : p >= 50 ? '#eab308' : '#22c55e';
+  const windowPanel = !w
+    ? `<div class="card"><div class="card-title">Current Window (5h)</div>
+        <p style="color:var(--muted);font-size:13px;">No active session window right now. Start using Claude and this fills in.</p></div>`
+    : (() => {
+        const cur = Math.min(100, w.currentPct);
+        const proj = Math.min(100, w.projectedPct);
+        const limitLabel = w.limit > 0
+          ? `${fmtTokens(w.limit)} tokens (${w.limitIsPeak ? 'historical-peak block — not your real plan cap' : 'configured cap'})`
+          : 'no limit set';
+        return `<div class="card">
+        <div class="card-title">Current Window (5h) · resets in ${fmtDuration(w.remainingMinutes)}</div>
+        <div class="win-bar">
+          <div class="win-fill" style="width:${cur.toFixed(1)}%;background:${barColor(w.currentPct)};"></div>
+          <div class="win-proj" style="left:${proj.toFixed(1)}%;" title="Projected end-of-window: ${pct(w.projectedPct)}"></div>
+        </div>
+        <div class="win-bar-labels">
+          <span><strong style="color:${barColor(w.currentPct)};">${pct(w.currentPct)}</strong> used now · ${pct(w.projectedPct)} projected by reset</span>
+          <span>Cap: ${limitLabel}</span>
+        </div>
+        <div class="win-stats">
+          <div><div class="label">Used this window</div><div class="value">${fmtTokens(w.usedTokens)} · ${$(w.usedCost)}</div></div>
+          <div><div class="label">Time left</div><div class="value">${fmtDuration(w.remainingMinutes)}</div></div>
+          <div><div class="label">Burn rate</div><div class="value">${$(w.costPerHour)}/hr</div></div>
+          <div><div class="label">Projected by reset</div><div class="value">${fmtTokens(w.projectedTokens)} · ${$(w.projectedCost)}</div></div>
+        </div>
+      </div>`;
+      })();
 
   const pipelineSection = d.pipelineExecutions.length === 0
     ? '<p style="color:var(--muted);font-size:13px;">No pipeline executions recorded yet. Runs appear here once <code>~/claude-dashboard/data/pipeline-executions.json</code> is populated.</p>'
@@ -505,6 +584,15 @@ function renderHTML(d) {
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
   .countdown { font-size: 12px; color: var(--muted); }
+  /* Current window */
+  .win-bar { position: relative; height: 14px; background: #0f172a; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 8px; }
+  .win-fill { height: 100%; border-radius: 8px 0 0 8px; transition: width 0.3s; }
+  .win-proj { position: absolute; top: -3px; width: 2px; height: 20px; background: #e2e8f0; }
+  .win-bar-labels { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+  .win-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 700px) { .win-stats { grid-template-columns: repeat(2, 1fr); } }
+  .win-stats .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 4px; }
+  .win-stats .value { font-size: 16px; font-weight: 700; }
   /* Pipeline executions */
   .pl-row { cursor: pointer; }
   .pl-caret { color: var(--muted); font-size: 10px; display: inline-block; }
@@ -542,6 +630,11 @@ function renderHTML(d) {
         ${c.sub ? `<div class="sub">${c.sub}</div>` : ''}
       </div>`).join('')}
     </div>
+  </section>
+
+  <!-- Current Window -->
+  <section>
+    ${windowPanel}
   </section>
 
   <!-- AI Insights -->

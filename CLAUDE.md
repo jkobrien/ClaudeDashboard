@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm install        # install dependencies (ccusage only)
 node server.js     # start the dashboard (also: npm start)
 PORT=8080 node server.js  # run on a different port
+TOKEN_LIMIT=44000000 node server.js  # set a real token cap for the current-window % (default "max")
 curl localhost:4242/refresh   # force cache invalidation without restart
 curl localhost:4242/api/data  # raw computed stats as JSON
 ```
@@ -18,9 +19,11 @@ The server binds to `127.0.0.1` only (localhost, no external access). There are 
 
 Single-file Node.js server (`server.js`) with no framework. All logic lives in one file:
 
-1. **Cache layer** — three in-memory slots (`daily`, `monthly`, `sessions`), each with a 5-minute TTL. `refreshIfStale()` calls `ccusage` subprocesses on demand; `invalidateCache()` is triggered by `GET /refresh`.
+1. **Cache layer** — four in-memory slots (`daily`, `monthly`, `sessions`, `blocks`), each with a 5-minute TTL. `refreshIfStale()` calls `ccusage` subprocesses on demand; `invalidateCache()` is triggered by `GET /refresh`. The `blocks` slot runs `ccusage blocks --active --token-limit ${TOKEN_LIMIT}` for the current-window gauge.
 
-2. **Data computation** (`compute()`) — calls `refreshIfStale()`, then derives all dashboard statistics from the three raw ccusage datasets: totals, projections, cache hit rates, per-model breakdowns, routing opportunities, and top sessions.
+2. **Data computation** (`compute()`) — calls `refreshIfStale()`, then derives all dashboard statistics from the raw ccusage datasets: totals, projections, cache hit rates, per-model breakdowns, routing opportunities, top sessions, and the current 5-hour window (`window`). It also reads `pipelineExecutions` directly from disk (see Pipeline metrics below).
+
+   **Current-window caveat:** ccusage's token limit is *not* your real Anthropic plan cap (the cap isn't in the JSONL logs). With the default `TOKEN_LIMIT=max` the percentage is measured against your own historical busiest 5-hour block; set `TOKEN_LIMIT` to a real number (read from Claude Code's `/usage`) for a true quota percentage.
 
 3. **Insights engine** (`generateInsights()`) — rule-based, receives the computed stats object, returns an array of `{severity, title, body, action}` objects. Eight rules matching the triggers defined in the design spec (`docs/superpowers/specs/2026-04-22-claude-dashboard-design.md`).
 
@@ -31,6 +34,8 @@ Single-file Node.js server (`server.js`) with no framework. All logic lives in o
 ## Data source
 
 `ccusage` reads Claude usage JSONL files from `~/.claude/projects/` or `~/.config/claude/projects/`. The binary is invoked as `./node_modules/.bin/ccusage <subcommand> --json`. If ccusage fails (e.g. no data yet), the relevant cache slot stays `null` and the dashboard renders with zero values rather than crashing.
+
+**Pipeline metrics (not ccusage):** the Pipeline Executions section reads `~/claude-dashboard/data/pipeline-executions.json` directly via `readPipelineExecutions()` — no subprocess, *not cached* (read fresh on every request). A missing, empty, or malformed file yields an empty state rather than a crash. Schema is `{ executions: [ { id, recorded_at, machine, task_*, blast_radius, status, stages, totals, ... } ] }`.
 
 ## Model grouping
 
