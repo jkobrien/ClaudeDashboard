@@ -2,11 +2,17 @@
 
 const http = require('http');
 const { execSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const PORT = parseInt(process.env.PORT || '4242', 10);
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const CCUSAGE = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
+
+// Per-stage pipeline run metrics, written by the executing-pipeline tooling.
+// NOT ccusage data — read directly from disk on every request.
+const PIPELINE_FILE = path.join(os.homedir(), 'claude-dashboard', 'data', 'pipeline-executions.json');
 
 // ---------------------------------------------------------------------------
 // Model helpers
@@ -14,6 +20,7 @@ const CCUSAGE = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
 
 function modelGroup(name = '') {
   const n = name.toLowerCase();
+  if (n.includes('opus') && (n.includes('4-8') || n.includes('4.8'))) return 'Opus 4.8';
   if (n.includes('opus') && (n.includes('4-7') || n.includes('4.7'))) return 'Opus 4.7';
   if (n.includes('opus')) return 'Opus 4.6';
   if (n.includes('sonnet')) return 'Sonnet';
@@ -21,7 +28,22 @@ function modelGroup(name = '') {
   return 'Other';
 }
 
+// Pipeline stage keys → human labels (insertion order = display order)
+const STAGE_LABELS = {
+  stage1_architect:   'Stage 1 · Architect',
+  stage2_builder:     'Stage 2 · Builder',
+  stage3_code_review: 'Stage 3 · Code Review',
+  stage3b_security:   'Stage 3b · Security',
+  stage3c_types:      'Stage 3c · Type Design',
+  stage3d_performance:'Stage 3d · Performance',
+  stage3e_ux:         'Stage 3e · UX',
+  stage4_arch_review: 'Stage 4 · Architecture Review',
+  stage5_challenger:  'Stage 5 · Challenger',
+};
+const stageLabel = k => STAGE_LABELS[k] || k;
+
 const MODEL_COLORS = {
+  'Opus 4.8': '#a21caf',
   'Opus 4.7': '#ef4444',
   'Opus 4.6': '#f97316',
   'Sonnet':   '#3b82f6',
@@ -73,6 +95,29 @@ function refreshIfStale() {
 
 function invalidateCache() {
   Object.keys(cache).forEach(k => { cache[k].ts = 0; });
+}
+
+// Read pipeline execution metrics fresh on every call (not cached). Tolerates a
+// missing, empty, or malformed file by returning [] so the dashboard renders an
+// empty state instead of crashing. Most recent execution first.
+function readPipelineExecutions() {
+  let raw;
+  try {
+    raw = fs.readFileSync(PIPELINE_FILE, 'utf8');
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('[pipeline] read failed:', e.message);
+    return [];
+  }
+  if (!raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    const execs = Array.isArray(parsed && parsed.executions) ? parsed.executions : [];
+    return [...execs].sort((a, b) =>
+      String(b && b.recorded_at || '').localeCompare(String(a && a.recorded_at || '')));
+  } catch (e) {
+    console.error('[pipeline] parse failed:', e.message);
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,21 +173,21 @@ function compute() {
     });
   });
   const total30    = Object.values(modelCosts30).reduce((s, v) => s + v, 0);
-  const opusCost30 = (modelCosts30['Opus 4.6'] || 0) + (modelCosts30['Opus 4.7'] || 0);
+  const opusCost30 = (modelCosts30['Opus 4.6'] || 0) + (modelCosts30['Opus 4.7'] || 0) + (modelCosts30['Opus 4.8'] || 0);
   const opusShare30 = total30 > 0 ? (opusCost30 / total30) * 100 : 0;
   const haikuShare30 = total30 > 0 ? ((modelCosts30['Haiku'] || 0) / total30) * 100 : 0;
 
   // Estimated Sonnet saving if all Opus were switched (Sonnet ~20% of Opus cost)
   const potentialSaving30 = opusCost30 * 0.8;
 
-  // opus-4-7 spend this month
-  const opus47Cost = (monthEntry.modelBreakdowns || [])
-    .filter(b => modelGroup(b.modelName) === 'Opus 4.7')
+  // flagship Opus (4.8) spend this month — the newest, most expensive model
+  const opusLatestCost = (monthEntry.modelBreakdowns || [])
+    .filter(b => modelGroup(b.modelName) === 'Opus 4.8')
     .reduce((s, b) => s + (b.cost || 0), 0);
 
   // --- Daily chart data (last 30 days) ---
   const chartLabels = last30.map(d => d.date.slice(5)); // MM-DD
-  const chartGroups = ['Opus 4.7', 'Opus 4.6', 'Sonnet', 'Haiku'];
+  const chartGroups = ['Opus 4.8', 'Opus 4.7', 'Opus 4.6', 'Sonnet', 'Haiku'];
   const chartDatasets = chartGroups.map(g => ({
     label: g,
     backgroundColor: MODEL_COLORS[g],
@@ -189,10 +234,11 @@ function compute() {
   return {
     allTime, thisMonthCost, todayCost, last7Cost, projection,
     cacheHitRate, cacheDeclining, last7Cache, prev7Cache,
-    modelCosts30, total30, opusShare30, haikuShare30, potentialSaving30, opus47Cost,
+    modelCosts30, total30, opusShare30, haikuShare30, potentialSaving30, opusLatestCost,
     chartLabels, chartDatasets,
     donutData, chartGroups,
     routingOpps, topSessions,
+    pipelineExecutions: readPipelineExecutions(),
     sessionCount: sessions.length,
     refreshedAt: new Date(Math.max(cache.daily.ts, cache.monthly.ts, cache.sessions.ts)).toISOString(),
   };
@@ -264,12 +310,12 @@ function generateInsights(d) {
     });
   }
 
-  if (d.opus47Cost > 50) {
+  if (d.opusLatestCost > 50) {
     insights.push({
       severity: 'medium',
-      title: `Opus 4.7 spend is $${d.opus47Cost.toFixed(2)} this month`,
-      body: 'Opus 4.7 is the most expensive model. Confirm it is being used intentionally.',
-      action: 'Audit sessions using claude-opus-4-7 — consider downgrading to Opus 4.6 or Sonnet.',
+      title: `Opus 4.8 spend is $${d.opusLatestCost.toFixed(2)} this month`,
+      body: 'Opus 4.8 is the newest and most expensive model. Confirm it is being used intentionally.',
+      action: 'Audit sessions using claude-opus-4-8 — consider downgrading to Sonnet for routine work.',
     });
   }
 
@@ -289,10 +335,23 @@ const shortPath = p => {
   return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : p;
 };
 
+function pillBadge(text, color) {
+  return `<span style="background:${color};color:#fff;border-radius:4px;padding:2px 8px;font-size:11px;font-weight:700;text-transform:uppercase;">${text}</span>`;
+}
+
 function severityBadge(s) {
   const map = { critical: '#ef4444', high: '#f97316', medium: '#eab308' };
-  const color = map[s] || '#6b7280';
-  return `<span style="background:${color};color:#fff;border-radius:4px;padding:2px 8px;font-size:11px;font-weight:700;text-transform:uppercase;">${s}</span>`;
+  return pillBadge(s, map[s] || '#6b7280');
+}
+
+function blastBadge(r) {
+  const map = { HIGH: '#ef4444', Standard: '#3b82f6', LOW: '#6b7280' };
+  return pillBadge(r || '—', map[r] || '#6b7280');
+}
+
+function statusBadge(s) {
+  const map = { COMPLETE: '#22c55e', ESCALATED: '#f97316' };
+  return pillBadge(s || '—', map[s] || '#6b7280');
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +391,62 @@ function renderHTML(d) {
     ['comment-analyzer',             'Haiku'],
     ['Docs / config / README',       'Haiku'],
   ];
+
+  const num = n => (n === undefined || n === null) ? '—' : n;
+  const fmtTs = ts => ts ? String(ts).replace('T', ' ').slice(0, 19) : '—';
+
+  const pipelineSection = d.pipelineExecutions.length === 0
+    ? '<p style="color:var(--muted);font-size:13px;">No pipeline executions recorded yet. Runs appear here once <code>~/claude-dashboard/data/pipeline-executions.json</code> is populated.</p>'
+    : `<table>
+        <thead><tr>
+          <th></th><th>Task</th><th>Blast Radius</th><th>Status</th><th>Cost</th>
+          <th>Fix Loops</th><th>Stages (run/skip)</th><th>Machine</th><th>Recorded (UTC)</th>
+        </tr></thead>
+        <tbody>
+        ${d.pipelineExecutions.map(e => {
+          const t = e.totals || {};
+          const stages = e.stages || {};
+          const stageRows = Object.entries(stages).map(([k, s]) => {
+            s = s || {};
+            const skipped = String(s.result || '').toUpperCase() === 'SKIPPED';
+            return `<tr${skipped ? ' class="skipped"' : ''}>
+              <td>${stageLabel(k)}</td>
+              <td>${s.model || '—'}</td>
+              <td>${s.result || '—'}</td>
+              <td>${s.cost_usd !== undefined && s.cost_usd !== null ? $(s.cost_usd) : '—'}</td>
+            </tr>`;
+          }).join('');
+          const f = t.findings || {};
+          const findingsLine = `gaps ${num(f.gaps)} · assumptions ${num(f.assumptions)} · hallucinations ${num(f.hallucinations)} · bugs caught ${num(f.bugs_caught)} · bugs fixed ${num(f.bugs_fixed)}`;
+          return `
+          <tr class="pl-row" onclick="togglePl(this)">
+            <td><span class="pl-caret">▶</span></td>
+            <td>#${num(e.task_number)} ${e.task_title || '(untitled)'}</td>
+            <td>${blastBadge(e.blast_radius)}</td>
+            <td>${statusBadge(e.status)}</td>
+            <td>${t.cost_usd !== undefined && t.cost_usd !== null ? $(t.cost_usd) : '—'}</td>
+            <td>${num(t.fix_loops_used)}</td>
+            <td>${num(t.stages_run)}/${num(t.stages_skipped)}</td>
+            <td>${e.machine || '—'}</td>
+            <td>${fmtTs(e.recorded_at)}</td>
+          </tr>
+          <tr class="pl-detail" style="display:none;">
+            <td colspan="9">
+              <div class="pl-detail-inner">
+                <div class="pl-meta">
+                  <span title="${e.plan || ''}">Plan: ${shortPath(e.plan)}</span>
+                  <span>Findings: ${findingsLine}</span>
+                </div>
+                <table class="stage-table">
+                  <thead><tr><th>Stage</th><th>Model</th><th>Result</th><th>Cost</th></tr></thead>
+                  <tbody>${stageRows || '<tr><td colspan="4" style="color:var(--muted);">No stage data.</td></tr>'}</tbody>
+                </table>
+              </div>
+            </td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -390,6 +505,15 @@ function renderHTML(d) {
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
   .countdown { font-size: 12px; color: var(--muted); }
+  /* Pipeline executions */
+  .pl-row { cursor: pointer; }
+  .pl-caret { color: var(--muted); font-size: 10px; display: inline-block; }
+  .pl-detail-inner { padding: 8px 12px 14px; }
+  .pl-meta { display: flex; flex-wrap: wrap; gap: 16px; color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .stage-table th { font-size: 10px; }
+  .stage-table td { font-size: 12px; }
+  tr.skipped td { color: var(--muted); }
+  .tag-opus48  { background: #a21caf; }
   .tag-opus47  { background: #ef4444; }
   .tag-opus46  { background: #f97316; }
   .tag-sonnet  { background: #3b82f6; }
@@ -480,7 +604,7 @@ function renderHTML(d) {
             ${d.topSessions.map(s => {
               const models = [...new Set((s.modelsUsed || []).map(modelGroup))];
               const pills = models.map(m => {
-                const cls = m === 'Opus 4.7' ? 'tag-opus47' : m === 'Opus 4.6' ? 'tag-opus46' : m === 'Sonnet' ? 'tag-sonnet' : m === 'Haiku' ? 'tag-haiku' : 'tag-other';
+                const cls = m === 'Opus 4.8' ? 'tag-opus48' : m === 'Opus 4.7' ? 'tag-opus47' : m === 'Opus 4.6' ? 'tag-opus46' : m === 'Sonnet' ? 'tag-sonnet' : m === 'Haiku' ? 'tag-haiku' : 'tag-other';
                 return `<span class="model-pill ${cls}">${m}</span>`;
               }).join('');
               return `
@@ -494,6 +618,14 @@ function renderHTML(d) {
           </tbody>
         </table>
       </div>
+    </div>
+  </section>
+
+  <!-- Pipeline Executions -->
+  <section>
+    <div class="section-title">Pipeline Executions</div>
+    <div class="card">
+      ${pipelineSection}
     </div>
   </section>
 
@@ -517,6 +649,16 @@ function renderHTML(d) {
 
 <script>
 (function() {
+  // Expandable pipeline rows
+  window.togglePl = function(row) {
+    const detail = row.nextElementSibling;
+    if (!detail) return;
+    const isOpen = detail.style.display !== 'none';
+    detail.style.display = isOpen ? 'none' : 'table-row';
+    const caret = row.querySelector('.pl-caret');
+    if (caret) caret.textContent = isOpen ? '▶' : '▼';
+  };
+
   // Charts
   const dailyCtx = document.getElementById('dailyChart').getContext('2d');
   new Chart(dailyCtx, {
