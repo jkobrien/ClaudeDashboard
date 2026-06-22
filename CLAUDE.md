@@ -8,7 +8,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm install        # install dependencies (ccusage only)
 node server.js     # start the dashboard (also: npm start)
 PORT=8080 node server.js  # run on a different port
-TOKEN_LIMIT=44000000 node server.js  # set a real token cap for the current-window % (default "max")
 curl localhost:4242/refresh   # force cache invalidation without restart
 curl localhost:4242/api/data  # raw computed stats as JSON
 ```
@@ -19,13 +18,13 @@ The server binds to `127.0.0.1` only (localhost, no external access). There are 
 
 Single-file Node.js server (`server.js`) with no framework. All logic lives in one file:
 
-1. **Cache layer** — four in-memory slots (`daily`, `monthly`, `sessions`, `blocks`), each with a 5-minute TTL. `refreshIfStale()` calls `ccusage` subprocesses on demand; `invalidateCache()` is triggered by `GET /refresh`. The `blocks` slot runs `ccusage blocks --active --token-limit ${TOKEN_LIMIT}` for the current-window gauge.
+1. **Cache layer** — four in-memory slots (`daily`, `monthly`, `sessions`, `blocks`), each with a 5-minute TTL. `refreshIfStale()` calls `ccusage` subprocesses on demand; `invalidateCache()` is triggered by `GET /refresh`. The `blocks` slot runs `ccusage blocks --active` for the current-block panel.
 
-2. **Data computation** (`compute()`) — calls `refreshIfStale()`, then derives all dashboard statistics from the raw ccusage datasets: totals, projections, cache hit rates, per-model breakdowns, routing opportunities, top sessions, and the current 5-hour window (`window`). It also reads `pipelineExecutions` directly from disk (see Pipeline metrics below).
+2. **Data computation** (`compute()`) — calls `refreshIfStale()`, then derives all dashboard statistics from the raw ccusage datasets: totals, projections, cache hit rates, per-model breakdowns, routing opportunities, top sessions, and the current 5-hour block (`window`: used/projected tokens & cost, burn rate, minutes left). It also reads `pipelineExecutions` directly from disk (see Pipeline metrics below).
 
-   **Current-window caveat:** ccusage's token limit is *not* your real Anthropic plan cap (the cap isn't in the JSONL logs). With the default `TOKEN_LIMIT=max` the percentage is measured against your own historical busiest 5-hour block; set `TOKEN_LIMIT` to a real number (read from Claude Code's `/usage`) for a true quota percentage.
+   **Limits are NOT trackable here:** the dashboard deliberately shows *no* "% of limit". Anthropic's real limits are percentage-based (session + weekly), weighted by model, and exposed only through Claude Code's interactive `/usage` screen — never written to the JSONL logs or any file ccusage can read. The Current 5-Hour Block panel is a relative burn/cost gauge for ccusage's own 5-hour block; do not present it as quota usage. Earlier attempts to derive a percentage (a `TOKEN_LIMIT` env var, `ccusage blocks --token-limit`) were removed precisely because the denominator can't be known.
 
-3. **Insights engine** (`generateInsights()`) — rule-based, receives the computed stats object, returns an array of `{severity, title, body, action}` objects. Eight rules matching the triggers defined in the design spec (`docs/superpowers/specs/2026-04-22-claude-dashboard-design.md`).
+3. **Insights engine** (`generateInsights()`) — rule-based, receives the computed stats object, returns an array of `{severity, title, body, action}` objects. Rules cover projection, Opus share, Haiku adoption, today's spend, cache decline, flagship-Opus spend, and a heavy-single-session proxy. The heavy-session rule keys off accumulated session cost, **not** duration/context — ccusage exposes neither, so the `/usage` "8h+ session" / ">150k context" drivers cannot be reproduced directly.
 
 4. **HTML renderer** (`renderHTML()`) — returns a complete HTML string with inline CSS, Chart.js (CDN), and inline JS for charts and the 300-second auto-reload countdown. Data is embedded as JSON literals in `<script>` tags — no separate API call from the page.
 
