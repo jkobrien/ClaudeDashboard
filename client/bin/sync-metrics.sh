@@ -82,10 +82,16 @@ case "$online" in
   no)      warn "'$HUB' is offline — records stay local, next sync will catch up"; exit 0 ;;
 esac
 
+# macOS ships openrsync, which has no --mkpath. Create the remote directory over
+# ssh first so this works with either openrsync or GNU rsync.
+# -n stops ssh consuming this script's stdin.
+ssh -n "$HUB" "mkdir -p ~/$REMOTE_DIR" 2>/dev/null \
+  || die "cannot reach $HUB over SSH — is Tailscale SSH enabled there?"
+
 sent=0
 for f in "$DATA_DIR/usage-$MACHINE.json" "$STAGED_PIPELINE"; do
   [ -f "$f" ] || continue
-  if rsync -q --mkpath "$f" "$HUB:$REMOTE_DIR/$(basename "$f")" 2>/dev/null; then
+  if rsync -q "$f" "$HUB:$REMOTE_DIR/$(basename "$f")" 2>/dev/null; then
     ok "sent $(basename "$f") ($(wc -c < "$f" | tr -d ' ') bytes)"
     sent=$((sent+1))
   else
