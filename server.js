@@ -12,7 +12,8 @@ const CCUSAGE = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
 
 // Per-stage pipeline run metrics, written by the executing-pipeline tooling.
 // NOT ccusage data — read directly from disk on every request.
-const PIPELINE_FILE = path.join(os.homedir(), 'claude-dashboard', 'data', 'pipeline-executions.json');
+const DATA_DIR = path.join(os.homedir(), '.claude-dashboard', 'data');
+const PIPELINE_FILE = path.join(DATA_DIR, 'pipeline-executions.json');
 
 // ---------------------------------------------------------------------------
 // Model helpers
@@ -107,23 +108,92 @@ function invalidateCache() {
 // missing, empty, or malformed file by returning [] so the dashboard renders an
 // empty state instead of crashing. Most recent execution first.
 function readPipelineExecutions() {
-  let raw;
+  // Merge every machine's store. Each machine syncs its own file
+  // (pipeline-<machine>.json) so three writers never contend on one file over
+  // the network — see client/bin/sync-metrics.sh. pipeline-executions.json is
+  // this machine's own local store.
+  const files = [];
   try {
-    raw = fs.readFileSync(PIPELINE_FILE, 'utf8');
+    for (const f of fs.readdirSync(DATA_DIR)) {
+      if (f === 'pipeline-executions.json' || /^pipeline-.+\.json$/.test(f)) {
+        files.push(path.join(DATA_DIR, f));
+      }
+    }
   } catch (e) {
-    if (e.code !== 'ENOENT') console.error('[pipeline] read failed:', e.message);
+    if (e.code !== 'ENOENT') console.error('[pipeline] readdir failed:', e.message);
     return [];
   }
-  if (!raw.trim()) return [];
-  try {
-    const parsed = JSON.parse(raw);
+
+  const seen = new Set();
+  const all = [];
+  for (const file of files) {
+    let parsed;
+    try {
+      const raw = fs.readFileSync(file, 'utf8');
+      if (!raw.trim()) continue;
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      console.error(`[pipeline] ${path.basename(file)}: ${e.message}`);
+      continue;
+    }
     const execs = Array.isArray(parsed && parsed.executions) ? parsed.executions : [];
-    return [...execs].sort((a, b) =>
-      String(b && b.recorded_at || '').localeCompare(String(a && a.recorded_at || '')));
-  } catch (e) {
-    console.error('[pipeline] parse failed:', e.message);
-    return [];
+    for (const e of execs) {
+      // A machine's local store and its synced copy hold the same records;
+      // dedupe on machine+id so the hub doesn't double-count its own runs.
+      const key = `${e && e.machine || '?'}::${e && e.id || Math.random()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      all.push(e);
+    }
   }
+  return all.sort((a, b) =>
+    String(b && b.recorded_at || '').localeCompare(String(a && a.recorded_at || '')));
+}
+
+// Per-machine usage summaries written by client/bin/export-usage.sh and synced
+// by client/bin/sync-metrics.sh. Each is ~30 KB; the raw transcripts they are
+// derived from never leave their machine.
+function readMachineUsage() {
+  const machines = [];
+  try {
+    for (const f of fs.readdirSync(DATA_DIR)) {
+      if (!/^usage-.+\.json$/.test(f)) continue;
+      try {
+        machines.push(JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), 'utf8')));
+      } catch (e) {
+        console.error(`[usage] ${f}: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('[usage] readdir failed:', e.message);
+  }
+  return machines.sort((a, b) => String(a.machine || '').localeCompare(String(b.machine || '')));
+}
+
+// Cost per repo, aggregated across the fleet.
+//
+// Repo names are already normalised by export-usage.sh, which resolves each
+// ccusage slug against the machine's actual repo list. That matters because the
+// slug encodes an ABSOLUTE path: the same repo is -Users-jkobrien-code-PDP on
+// macOS and -home-jkobrien-code-PDP on Linux. Without normalisation one repo
+// would appear twice.
+function computeRepoCosts(machines) {
+  const repos = {};
+  for (const m of machines) {
+    for (const [repo, v] of Object.entries(m.by_repo || {})) {
+      const r = repos[repo] || (repos[repo] = {
+        repo, cost: 0, tokens: 0, sessions: 0, machines: {}, models: new Set(),
+      });
+      r.cost += Number(v.cost || 0);
+      r.tokens += Number(v.tokens || 0);
+      r.sessions += Number(v.sessions || 0);
+      r.machines[m.machine] = Number(v.cost || 0);
+      for (const mod of (v.models || [])) r.models.add(mod);
+    }
+  }
+  return Object.values(repos)
+    .map(r => ({ ...r, models: [...r.models].sort() }))
+    .sort((a, b) => b.cost - a.cost);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +201,7 @@ function readPipelineExecutions() {
 // ---------------------------------------------------------------------------
 
 function compute() {
+  const MACHINE_USAGE = readMachineUsage();
   refreshIfStale();
 
   const daily    = (cache.daily.data    || {}).daily    || [];
@@ -264,6 +335,8 @@ function compute() {
     routingOpps, topSessions,
     window,
     pipelineExecutions: readPipelineExecutions(),
+    machineUsage: MACHINE_USAGE,
+    repoCosts: computeRepoCosts(MACHINE_USAGE),
     sessionCount: sessions.length,
     refreshedAt: new Date(Math.max(cache.daily.ts, cache.monthly.ts, cache.sessions.ts)).toISOString(),
   };
@@ -461,8 +534,44 @@ function renderHTML(d) {
         <p class="win-note">Relative burn for the current ccusage 5-hour block — <strong>not</strong> your plan limit. For true session/weekly limit usage, run <code>/usage</code> in Claude Code.</p>
       </div>`;
 
+  // Cost per repo, across every machine that has synced. Answers "how much is
+  // each repo costing to build" — the fleet-wide view.
+  const repoSection = (d.repoCosts || []).length === 0
+    ? '<p style="color:var(--muted);font-size:13px;">No per-repo usage yet. Run <code>~/.claude-dashboard/bin/export-usage.sh</code>, then <code>sync-metrics.sh</code> on each machine.</p>'
+    : (() => {
+        const total = d.repoCosts.reduce((s, r) => s + r.cost, 0) || 1;
+        const machines = [...new Set(d.repoCosts.flatMap(r => Object.keys(r.machines)))].sort();
+        const multi = machines.length > 1;
+        return `
+        <table class="tbl">
+          <thead><tr>
+            <th>Repo</th><th class="num">Cost</th><th class="num">Share</th>
+            <th class="num">Tokens</th><th class="num">Sessions</th>
+            ${multi ? machines.map(m => `<th class="num">${m}</th>`).join('') : '<th>Models</th>'}
+          </tr></thead>
+          <tbody>
+            ${d.repoCosts.map(r => `
+            <tr>
+              <td><strong>${r.repo}</strong></td>
+              <td class="num">${$(r.cost)}</td>
+              <td class="num">${pct(r.cost / total * 100)}</td>
+              <td class="num">${fmtTokens(r.tokens)}</td>
+              <td class="num">${r.sessions}</td>
+              ${multi
+                ? machines.map(m => `<td class="num">${r.machines[m] ? $(r.machines[m]) : '—'}</td>`).join('')
+                : `<td>${r.models.map(m => pillBadge(modelGroup(m), MODEL_COLORS[modelGroup(m)] || '#888')).join(' ')}</td>`}
+            </tr>`).join('')}
+          </tbody>
+        </table>
+        <p style="color:var(--muted);font-size:12px;margin-top:8px;">
+          ${machines.length} machine${machines.length === 1 ? '' : 's'} reporting: ${machines.join(', ')}.
+          Repo names are normalised across machines — the same repo has a different
+          project slug on macOS and Linux.
+        </p>`;
+      })();
+
   const pipelineSection = d.pipelineExecutions.length === 0
-    ? '<p style="color:var(--muted);font-size:13px;">No pipeline executions recorded yet. Runs appear here once <code>~/claude-dashboard/data/pipeline-executions.json</code> is populated.</p>'
+    ? '<p style="color:var(--muted);font-size:13px;">No pipeline executions recorded yet. Runs appear here once <code>~/.claude-dashboard/data/pipeline-executions.json</code> is populated.</p>'
     : `<table>
         <thead><tr>
           <th></th><th>Task</th><th>Blast Radius</th><th>Status</th><th>Cost</th>
@@ -697,6 +806,12 @@ function renderHTML(d) {
         </table>
       </div>
     </div>
+  </section>
+
+  <!-- Cost by Repo -->
+  <section>
+    <div class="section-title">Cost by Repo</div>
+    ${repoSection}
   </section>
 
   <!-- Pipeline Executions -->

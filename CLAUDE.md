@@ -34,7 +34,7 @@ Single-file Node.js server (`server.js`) with no framework. All logic lives in o
 
 `ccusage` reads Claude usage JSONL files from `~/.claude/projects/` or `~/.config/claude/projects/`. The binary is invoked as `./node_modules/.bin/ccusage <subcommand> --json`. If ccusage fails (e.g. no data yet), the relevant cache slot stays `null` and the dashboard renders with zero values rather than crashing.
 
-**Pipeline metrics (not ccusage):** the Pipeline Executions section reads `~/claude-dashboard/data/pipeline-executions.json` directly via `readPipelineExecutions()` — no subprocess, *not cached* (read fresh on every request). A missing, empty, or malformed file yields an empty state rather than a crash. Schema is `{ executions: [ { id, recorded_at, machine, task_*, blast_radius, status, stages, totals, ... } ] }`.
+**Pipeline metrics (not ccusage):** the Pipeline Executions section reads `~/.claude-dashboard/data/pipeline-executions.json` directly via `readPipelineExecutions()` — no subprocess, *not cached* (read fresh on every request). A missing, empty, or malformed file yields an empty state rather than a crash. Schema is `{ executions: [ { id, recorded_at, machine, task_*, blast_radius, status, stages, totals, ... } ] }`.
 
 ## Model grouping
 
